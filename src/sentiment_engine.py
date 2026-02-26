@@ -1,128 +1,147 @@
 import pandas as pd
 import numpy as np
-from gnews import GNews
+from GoogleNews import GoogleNews
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from datetime import datetime, timedelta
 import torch
-import logging
 
-logging.getLogger("transformers").setLevel(logging.ERROR)
 
+# ==========================================
+# 1️⃣ LOAD FINBERT (AUTO GPU DETECTION)
+# ==========================================
 
 class FinBERTSentiment:
 
     def __init__(self):
-
+        print("Loading FinBERT model...")
+        
         self.device = 0 if torch.cuda.is_available() else -1
-
+        
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-
+        
         self.pipe = pipeline(
             "sentiment-analysis",
             model=self.model,
             tokenizer=self.tokenizer,
             device=self.device
         )
-
-        self.gnews = GNews(language='en', country='IN', max_results=50)
-        self.asset_queries = {
-                "NIFTY": "Indian stock market OR NIFTY OR Sensex",
-                "GOLD": "Gold price India OR MCX Gold",
-                "USDINR": "USD INR OR Indian rupee OR forex India",
-                "CRUDE": "Crude oil India OR Brent oil OR WTI oil"
-        }
+        
+        print("FinBERT Loaded Successfully.")
 
 
-    def _safe_date(self, published, fallback):
-        try:
-            dt = pd.to_datetime(published, errors="coerce")
-            if pd.isna(dt):
-                return fallback
-            return dt.to_pydatetime()
-        except:
-            return fallback
+    # ==========================================
+    # 2️⃣ NEWS FETCHING
+    # ==========================================
+    
+    def fetch_news(self, days=7):
+        
+        queries = [
+            "NIFTY 50 India",
+            "RBI policy India",
+            "Indian stock market crash",
+            "USD INR India",
+            "Gold price India",
+            "Crude oil India"
+        ]
+        
+        googlenews = GoogleNews(lang="en", region="IN")
+        googlenews.set_period(f"{days}d")
+        
+        all_results = []
+        
+        for query in queries:
+            googlenews.search(query)
+            for page in range(1, 4):
+                googlenews.get_page(page)
+            
+            results = googlenews.results()
+            all_results.extend(results)
+            googlenews.clear()
+        
+        processed_data = []
+        current_date = datetime.now()
+        
+        for item in all_results:
+            
+            headline = item.get("title", "")
+            date_str = item.get("date", "")
+            entry_date = current_date
+            
+            try:
+                if "hour" in date_str or "min" in date_str:
+                    entry_date = current_date
+                elif "day" in date_str:
+                    days_ago = int(date_str.split(" ")[0])
+                    entry_date = current_date - timedelta(days=days_ago)
+            except:
+                pass
+            
+            processed_data.append({
+                "date": entry_date.date(),
+                "headline": headline
+            })
+        
+        df = pd.DataFrame(processed_data).drop_duplicates()
+        return df
 
 
-    def fetch_asset_news(self, asset, days=7):
+    # ==========================================
+    # 3️⃣ BATCH SENTIMENT SCORING (FAST)
+    # ==========================================
 
-        end = datetime.now()
-        start = end - timedelta(days=days)
-
-        query = self.asset_queries[asset]
-
-        articles = self.gnews.get_news(query)
-        records = []
-
-        for article in articles:
-
-            title = article.get("title", "")
-            if not title:
-                continue
-
-            published = article.get("published date")
-            dt = self._safe_date(published, end)
-
-            if start <= dt <= end:
-                records.append({
-                    "date": dt.date(),
-                    "headline": title
-                })
-
-        return pd.DataFrame(records).drop_duplicates()
-
-
-    def compute_sentiment(self, df, batch_size=16):
-
-        if df.empty:
+    def compute_sentiment(self, news_df, batch_size=16):
+        
+        if news_df.empty:
             return pd.DataFrame()
+        
+        print(f"Analyzing {len(news_df)} headlines...")
 
-        texts = df["headline"].astype(str).tolist()
-        scores = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
+        headlines = news_df["headline"].astype(str).tolist()
+        
+        sentiment_scores = []
+        
+        for i in range(0, len(headlines), batch_size):
+            batch = headlines[i:i+batch_size]
             outputs = self.pipe(batch, truncation=True)
-
-            for o in outputs:
-                label = o["label"].lower()
-                score = o["score"]
-
+            
+            for output in outputs:
+                label = output["label"].lower()
+                score = output["score"]
+                
                 if label == "positive":
-                    scores.append(score)
+                    sentiment_scores.append(score)
                 elif label == "negative":
-                    scores.append(-score)
+                    sentiment_scores.append(-score)
                 else:
-                    scores.append(0.0)
+                    sentiment_scores.append(0.0)
+        
+        news_df["sentiment_score"] = sentiment_scores
+        
+        daily_sentiment = (
+            news_df
+            .groupby("date")["sentiment_score"]
+            .mean()
+            .reset_index()
+            .sort_values("date")
+        )
+        
+        return daily_sentiment
 
-        df = df.copy()
-        df["score"] = scores
 
-        daily = df.groupby("date")["score"].mean().to_frame()
+    # ==========================================
+    # 4️⃣ FULL PIPELINE
+    # ==========================================
 
-        return daily
+    def get_daily_sentiment(self, days=7):
+        
+        news_df = self.fetch_news(days=days)
+        
+        if news_df.empty:
+            print("No news found.")
+            return pd.DataFrame()
+        
+        daily_sentiment = self.compute_sentiment(news_df)
+        
+        return daily_sentiment
 
-
-    def get_asset_sentiment(self, days=7):
-
-        all_sentiment = {}
-
-        for asset in self.asset_queries.keys():
-
-            df = self.fetch_asset_news(asset, days)
-            daily = self.compute_sentiment(df)
-
-            daily.columns = [f"{asset}_sentiment"]
-
-            all_sentiment[asset] = daily
-
-        # Merge all asset sentiment series
-        final_df = None
-
-        for df in all_sentiment.values():
-            if final_df is None:
-                final_df = df
-            else:
-                final_df = final_df.join(df, how="outer")
-
-        return final_df.fillna(0)

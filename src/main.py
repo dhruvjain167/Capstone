@@ -20,58 +20,30 @@ returns = compute_returns(prices)
 # Ensure datetime index
 returns.index = pd.to_datetime(returns.index)
 
-# Remove invalid values
-returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-
-# 🔥 Scale returns to percentage (for GARCH stability)
-returns = returns * 100
-
 
 # ==========================================
-# 2️⃣ LOAD ASSET-SPECIFIC SENTIMENT
+# 2️⃣ LOAD SENTIMENT DATA
 # ==========================================
 
-print("Fetching asset-specific sentiment...")
+print("Fetching market sentiment...")
 sent_engine = FinBERTSentiment()
 
-asset_sentiment = sent_engine.get_asset_sentiment(days=14)
+daily_sentiment = sent_engine.get_daily_sentiment(days=14)
 
-if asset_sentiment.empty:
+if daily_sentiment.empty:
     print("No sentiment data found. Using zero sentiment.")
-    sentiment_cols = [
-        "NIFTY_sentiment",
-        "GOLD_sentiment",
-        "USDINR_sentiment",
-        "CRUDE_sentiment"
-    ]
-    for col in sentiment_cols:
-        returns[col] = 0.0
+    returns["sentiment_score"] = 0.0
 
 else:
-    # Ensure datetime index
-    asset_sentiment.index = pd.to_datetime(asset_sentiment.index)
+    # Convert sentiment date column to datetime index
+    daily_sentiment["date"] = pd.to_datetime(daily_sentiment["date"])
+    daily_sentiment.set_index("date", inplace=True)
 
-    # Merge safely
-    returns = returns.join(asset_sentiment, how="left")
+    # Merge on index (clean way)
+    returns = returns.join(daily_sentiment, how="left")
 
-    sentiment_cols = [
-        "NIFTY_sentiment",
-        "GOLD_sentiment",
-        "USDINR_sentiment",
-        "CRUDE_sentiment"
-    ]
-
-    # Ensure all sentiment columns exist
-    for col in sentiment_cols:
-        if col not in returns.columns:
-            returns[col] = 0.0
-
-    # Fill missing sentiment
-    returns[sentiment_cols] = returns[sentiment_cols].fillna(0.0)
-
-    # 🔥 VERY IMPORTANT: Lag sentiment (avoid lookahead bias)
-    returns[sentiment_cols] = returns[sentiment_cols].shift(1)
-    returns[sentiment_cols] = returns[sentiment_cols].fillna(0.0)
+    # Fill missing sentiment values
+    returns["sentiment_score"] = returns["sentiment_score"].fillna(0.0)
 
 
 print("Final dataset ready.")
@@ -90,7 +62,7 @@ portfolio_returns = run_backtest(returns)
 # 4️⃣ EVALUATION
 # ==========================================
 
-# Align unhedged returns
+# Align unhedged NIFTY series
 unhedged = returns["NIFTY"].iloc[-len(portfolio_returns):]
 
 print("\n========== PERFORMANCE ==========")
@@ -100,7 +72,7 @@ print("Hedge Effectiveness:", round(hedge_effectiveness(unhedged, portfolio_retu
 
 
 # ==========================================
-# 5️⃣ SAVE OUTPUT
+# 5️⃣ OPTIONAL: SAVE OUTPUT
 # ==========================================
 
 results_df = pd.DataFrame({
