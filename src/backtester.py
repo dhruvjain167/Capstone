@@ -17,6 +17,12 @@ from config import (
     MAX_GROSS_EXPOSURE,
     TRANSACTION_COST_BPS,
     SENTIMENT_STRENGTH,
+    SAFE_ASSET,
+    MIN_SAFE_ALLOCATION,
+    MAX_SAFE_ALLOCATION,
+    MOMENTUM_LOOKBACK,
+    DRAWDOWN_LOOKBACK,
+    DRAWDOWN_THRESHOLD,
 )
 from .garch_x_model import fit_garch, fit_garch_x
 from .dcc_model import compute_dcc
@@ -46,6 +52,40 @@ def _weights_to_dict(assets, values):
     return {asset: float(val) for asset, val in zip(assets, values)}
 
 
+def _rolling_momentum(series, lookback):
+    if len(series) < lookback:
+        return 0.0
+    return float(np.prod(1 + series[-lookback:]) - 1)
+
+
+def _portfolio_drawdown(recent_returns):
+    if len(recent_returns) == 0:
+        return 0.0
+    cumulative = np.cumprod(1 + np.asarray(recent_returns, dtype=float))
+    peaks = np.maximum.accumulate(cumulative)
+    dd = (cumulative - peaks) / np.maximum(peaks, 1e-12)
+    return float(dd.min())
+
+
+def _safe_allocation(sentiment_t, target_window, recent_portfolio_returns):
+    sentiment_penalty = max(float(np.tanh(-sentiment_t)), 0.0)
+    momentum = _rolling_momentum(target_window.values, MOMENTUM_LOOKBACK)
+    momentum_penalty = 1.0 if momentum < 0 else 0.0
+
+    vol_now = np.std(target_window.values[-MOMENTUM_LOOKBACK:]) if len(target_window) >= MOMENTUM_LOOKBACK else np.std(target_window.values)
+    vol_baseline = np.std(target_window.values)
+    vol_stress = np.clip((vol_now / max(vol_baseline, 1e-8)) - 1.0, 0.0, 1.0)
+
+    lookback_returns = recent_portfolio_returns[-DRAWDOWN_LOOKBACK:]
+    drawdown = _portfolio_drawdown(lookback_returns)
+    drawdown_penalty = np.clip(abs(min(drawdown, 0.0)) / abs(DRAWDOWN_THRESHOLD), 0.0, 1.0)
+
+    stress_score = 0.35 * sentiment_penalty + 0.30 * momentum_penalty + 0.20 * vol_stress + 0.15 * drawdown_penalty
+    safe_w = MIN_SAFE_ALLOCATION + (MAX_SAFE_ALLOCATION - MIN_SAFE_ALLOCATION) * np.clip(stress_score, 0.0, 1.0)
+
+    return float(np.clip(safe_w, MIN_SAFE_ALLOCATION, MAX_SAFE_ALLOCATION)), float(stress_score), float(drawdown)
+
+
 def run_backtest(df, return_diagnostics=False):
     if "sentiment_score" not in df.columns:
         df = df.copy()
@@ -56,6 +96,7 @@ def run_backtest(df, return_diagnostics=False):
 
     returns = df[ordered_assets]
     sentiment = df["sentiment_score"].fillna(0.0)
+    safe_returns = df[SAFE_ASSET].fillna(0.0) if SAFE_ASSET in df.columns else pd.Series(0.0, index=df.index)
 
     engine = HedgeEngine()
     portfolio_returns = []
@@ -143,9 +184,17 @@ def run_backtest(df, return_diagnostics=False):
         hedge_returns = float(np.dot(final_weights, hedge_asset_returns))
         raw_portfolio_r = target_return - hedge_returns - cost
 
+        safe_weight, stress_score, rolling_drawdown = _safe_allocation(
+            sentiment.iloc[t],
+            returns[TARGET_ASSET].iloc[t - WINDOW : t],
+            portfolio_returns,
+        )
+        safe_return = float(safe_returns.iloc[t])
+        blended_portfolio_r = (1.0 - safe_weight) * raw_portfolio_r + safe_weight * safe_return
+
         est_vol = _ewma_volatility(portfolio_returns, lam=EWMA_LAMBDA)
         leverage = float(np.clip(VOL_TARGET / max(est_vol, 1e-6), 0.5, 1.5))
-        portfolio_r = raw_portfolio_r * leverage
+        portfolio_r = blended_portfolio_r * leverage
 
         portfolio_returns.append(portfolio_r)
 
@@ -158,8 +207,14 @@ def run_backtest(df, return_diagnostics=False):
             "hedge_return": hedge_returns,
             "transaction_cost": cost,
             "raw_hedged_return": raw_portfolio_r,
+            "blended_return_pre_leverage": blended_portfolio_r,
             "leverage": leverage,
             "hedged_return": portfolio_r,
+            "safe_asset": SAFE_ASSET,
+            "safe_asset_return": safe_return,
+            "safe_allocation": safe_weight,
+            "regime_stress": stress_score,
+            "rolling_drawdown": rolling_drawdown,
             "sentiment_score": float(sentiment.iloc[t]),
             "sentiment_multiplier": sentiment_multiplier,
             "confidence_scale": confidence,
