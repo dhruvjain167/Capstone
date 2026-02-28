@@ -182,6 +182,30 @@ if diag_path.exists():
         )
         st.plotly_chart(fig_impl, use_container_width=True)
 
+    if {"safe_allocation", "safe_asset_return", "regime_stress"}.issubset(diag_df.columns):
+        st.subheader("Defensive Safe-Asset Overlay")
+        c_safe_1, c_safe_2 = st.columns(2)
+        with c_safe_1:
+            fig_safe = px.line(
+                diag_df,
+                x="date" if "date" in diag_df.columns else diag_df.index,
+                y=["safe_allocation", "regime_stress"],
+                title="Dynamic Safe Allocation vs Regime Stress",
+            )
+            st.plotly_chart(fig_safe, use_container_width=True)
+        with c_safe_2:
+            safe_stats = pd.DataFrame(
+                {
+                    "Metric": ["Average Safe Allocation", "Latest Safe Allocation", "Average Safe Asset Return"],
+                    "Value": [
+                        diag_df["safe_allocation"].mean(),
+                        diag_df["safe_allocation"].iloc[-1],
+                        diag_df["safe_asset_return"].mean(),
+                    ],
+                }
+            )
+            st.dataframe(safe_stats.style.format({"Value": "{:.2%}"}), hide_index=True)
+
 st.subheader("Parameter Explanations")
 st.markdown(
     """
@@ -193,5 +217,7 @@ st.markdown(
 - **SENTIMENT_STRENGTH**: controls how strongly news sentiment scales hedge ratios.
 - **VOL_TARGET / EWMA_LAMBDA**: risk-targeting to stabilize realized volatility.
 - **TRANSACTION_COST_BPS**: implementation drag proxy to avoid overfitting unrealistic gross returns.
+- **SAFE_ASSET / MIN_SAFE_ALLOCATION / MAX_SAFE_ALLOCATION**: defensive sleeve that scales into safer exposure under stress.
+- **MOMENTUM_LOOKBACK / DRAWDOWN_THRESHOLD**: regime triggers that increase capital preservation in weak markets.
 """
 )
