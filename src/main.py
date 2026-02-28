@@ -4,7 +4,16 @@ import pandas as pd
 from src.load_asset import load_all_assets, compute_returns
 from src.sentiment_engine import FinBERTSentiment
 from src.backtester import run_backtest
-from src.evaluation import sharpe_ratio, max_drawdown, hedge_effectiveness
+from src.evaluation import (
+    sharpe_ratio,
+    sortino_ratio,
+    annualized_return,
+    annualized_volatility,
+    max_drawdown,
+    calmar_ratio,
+    value_at_risk,
+    hedge_effectiveness,
+)
 from config import TARGET_ASSET
 
 
@@ -29,6 +38,19 @@ def _load_sentiment(returns, days=14):
     return returns
 
 
+def _compute_metrics(unhedged, hedged):
+    return {
+        "sharpe_ratio": float(sharpe_ratio(hedged)),
+        "sortino_ratio": float(sortino_ratio(hedged)),
+        "annualized_return": float(annualized_return(hedged)),
+        "annualized_volatility": float(annualized_volatility(hedged)),
+        "max_drawdown": float(max_drawdown(hedged)),
+        "calmar_ratio": float(calmar_ratio(hedged)),
+        "var_95": float(value_at_risk(hedged, q=0.05)),
+        "hedge_effectiveness": float(hedge_effectiveness(unhedged, hedged)),
+    }
+
+
 def main():
     print("Loading asset prices...")
     prices = load_all_assets()
@@ -43,15 +65,11 @@ def main():
     portfolio_returns, diagnostics = run_backtest(returns, return_diagnostics=True)
 
     unhedged = returns[TARGET_ASSET].iloc[-len(portfolio_returns) :]
-
-    metrics = {
-        "sharpe_ratio": float(sharpe_ratio(portfolio_returns)),
-        "max_drawdown": float(max_drawdown(portfolio_returns)),
-        "hedge_effectiveness": float(hedge_effectiveness(unhedged, portfolio_returns)),
-    }
+    metrics = _compute_metrics(unhedged, portfolio_returns)
 
     print("\n========== PERFORMANCE ==========")
     print("Sharpe Ratio:", round(metrics["sharpe_ratio"], 4))
+    print("Sortino Ratio:", round(metrics["sortino_ratio"], 4))
     print("Max Drawdown:", round(metrics["max_drawdown"], 4))
     print("Hedge Effectiveness:", round(metrics["hedge_effectiveness"], 4))
 
