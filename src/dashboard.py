@@ -45,6 +45,16 @@ k5.metric("Ann. Return", f"{metrics.get('annualized_return', np.nan):.2%}")
 k6.metric("Ann. Vol", f"{metrics.get('annualized_volatility', np.nan):.2%}")
 k7.metric("VaR (95%)", f"{metrics.get('var_95', np.nan):.3%}")
 
+
+k8, k9, k10 = st.columns(3)
+k8.metric("Var Red. p-value", f"{metrics.get('variance_reduction_p_value', np.nan):.4f}")
+k9.metric("Avg Safe Allocation", f"{metrics.get('avg_safe_allocation', np.nan):.2%}")
+k10.metric("Avg Hedge Quality", f"{metrics.get('avg_hedge_quality_scale', np.nan):.2%}")
+
+k11, k12 = st.columns(2)
+k11.metric("HE Uplift vs Baseline", f"{metrics.get('hedge_effectiveness_uplift_pct', np.nan):.2%}")
+k12.metric("Selected Strategy", f"{metrics.get('selected_strategy', 'n/a')}")
+
 st.subheader("Industry-Standard Interpretation")
 interp = []
 if metrics:
@@ -61,6 +71,20 @@ if metrics:
     interp.append(
         f"Max drawdown {mdd:.3f}: {'drawdown is controlled' if abs(mdd) < 0.12 else 'tail risk remains high; reduce gross hedge and turnover during unstable regimes'}"
     )
+
+    p_val = metrics.get("variance_reduction_p_value", np.nan)
+    ci_low = metrics.get("variance_reduction_ci_low", np.nan)
+    ci_high = metrics.get("variance_reduction_ci_high", np.nan)
+    if np.isfinite(p_val):
+        interp.append(
+            f"Variance reduction significance p={p_val:.4f}: {'statistically significant improvement' if p_val < 0.05 and ci_low > 0 else 'not yet statistically significant'} (95% CI of daily variance delta: [{ci_low:.6f}, {ci_high:.6f}])"
+        )
+
+    uplift = metrics.get("hedge_effectiveness_uplift_pct", np.nan)
+    if np.isfinite(uplift):
+        interp.append(
+            f"Hedge-effectiveness uplift vs baseline {uplift:.2%}: {'meets 10–15% investor target zone' if uplift >= 0.10 else 'below 10% target, continue tuning quality filters and cost controls'}"
+        )
 
 st.markdown("\n".join([f"- {x}" for x in interp]) if interp else "Run backtest to generate interpretation.")
 
@@ -182,6 +206,18 @@ if diag_path.exists():
         )
         st.plotly_chart(fig_impl, use_container_width=True)
 
+        if {"raw_hedged_return", "hedged_return"}.issubset(diag_df.columns):
+            tc_df = diag_df.copy()
+            tc_df["gross_no_cost"] = tc_df["raw_hedged_return"] + tc_df["transaction_cost"]
+            tc_df["net_after_cost"] = tc_df["hedged_return"]
+            fig_tc = px.line(
+                tc_df,
+                x="date" if "date" in tc_df.columns else tc_df.index,
+                y=["gross_no_cost", "net_after_cost"],
+                title="Gross vs Net (After Costs) Return Trace",
+            )
+            st.plotly_chart(fig_tc, use_container_width=True)
+
     if {"safe_allocation", "safe_asset_return", "regime_stress"}.issubset(diag_df.columns):
         st.subheader("Defensive Safe-Asset Overlay")
         c_safe_1, c_safe_2 = st.columns(2)
@@ -219,5 +255,7 @@ st.markdown(
 - **TRANSACTION_COST_BPS**: implementation drag proxy to avoid overfitting unrealistic gross returns.
 - **SAFE_ASSET / MIN_SAFE_ALLOCATION / MAX_SAFE_ALLOCATION**: defensive sleeve that scales into safer exposure under stress.
 - **MOMENTUM_LOOKBACK / DRAWDOWN_THRESHOLD**: regime triggers that increase capital preservation in weak markets.
+- **HEDGE_SHRINKAGE / CORRELATION_FLOOR**: enforces conservative hedge sizing and only keeps hedges with robust realized co-movement.
+- **NO_TRADE_BAND / STABILITY_LOOKBACK**: reduces over-trading and increases post-cost robustness.
 """
 )

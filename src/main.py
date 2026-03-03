@@ -13,8 +13,10 @@ from src.evaluation import (
     calmar_ratio,
     value_at_risk,
     hedge_effectiveness,
+    variance_reduction_significance,
+    hedge_effectiveness_uplift_pct,
 )
-from config import TARGET_ASSET
+from config import TARGET_ASSET, BOOTSTRAP_SAMPLES, RANDOM_SEED
 
 
 def _load_sentiment(returns, days=14):
@@ -38,8 +40,15 @@ def _load_sentiment(returns, days=14):
     return returns
 
 
-def _compute_metrics(unhedged, hedged):
-    return {
+def _compute_metrics(unhedged, hedged, diagnostics):
+    p_val, delta_mean, delta_ci = variance_reduction_significance(
+        unhedged,
+        hedged,
+        n_bootstrap=BOOTSTRAP_SAMPLES,
+        seed=RANDOM_SEED,
+    )
+
+    metrics = {
         "sharpe_ratio": float(sharpe_ratio(hedged)),
         "sortino_ratio": float(sortino_ratio(hedged)),
         "annualized_return": float(annualized_return(hedged)),
@@ -48,7 +57,23 @@ def _compute_metrics(unhedged, hedged):
         "calmar_ratio": float(calmar_ratio(hedged)),
         "var_95": float(value_at_risk(hedged, q=0.05)),
         "hedge_effectiveness": float(hedge_effectiveness(unhedged, hedged)),
+        "variance_reduction_p_value": float(p_val),
+        "variance_reduction_mean_delta": float(delta_mean),
+        "variance_reduction_ci_low": float(delta_ci[0]),
+        "variance_reduction_ci_high": float(delta_ci[1]),
     }
+
+    if not diagnostics.empty:
+        if "raw_hedged_return" in diagnostics.columns:
+            metrics["annualized_return_gross_pre_blend"] = float(annualized_return(diagnostics["raw_hedged_return"].values))
+        if "safe_allocation" in diagnostics.columns:
+            metrics["avg_safe_allocation"] = float(diagnostics["safe_allocation"].mean())
+        if "turnover" in diagnostics.columns:
+            metrics["avg_turnover"] = float(diagnostics["turnover"].mean())
+        if "hedge_quality_scale" in diagnostics.columns:
+            metrics["avg_hedge_quality_scale"] = float(diagnostics["hedge_quality_scale"].mean())
+
+    return metrics
 
 
 def main():
@@ -61,26 +86,64 @@ def main():
 
     returns = _load_sentiment(returns, days=14)
 
-    print("\nRunning dynamic hedge backtest...")
-    portfolio_returns, diagnostics = run_backtest(returns, return_diagnostics=True)
+    print("\nRunning baseline backtest...")
+    baseline_returns, baseline_diag = run_backtest(
+        returns,
+        return_diagnostics=True,
+        use_defensive_overlay=False,
+        use_quality_controls=False,
+    )
 
-    unhedged = returns[TARGET_ASSET].iloc[-len(portfolio_returns) :]
-    metrics = _compute_metrics(unhedged, portfolio_returns)
+    print("Running enhanced backtest...")
+    enhanced_returns, enhanced_diag = run_backtest(
+        returns,
+        return_diagnostics=True,
+        use_defensive_overlay=True,
+        use_quality_controls=True,
+    )
+
+    unhedged_base = returns[TARGET_ASSET].iloc[-len(baseline_returns) :]
+    unhedged_enh = returns[TARGET_ASSET].iloc[-len(enhanced_returns) :]
+
+    baseline_metrics = _compute_metrics(unhedged_base, baseline_returns, baseline_diag)
+    enhanced_metrics = _compute_metrics(unhedged_enh, enhanced_returns, enhanced_diag)
+
+    uplift = hedge_effectiveness_uplift_pct(
+        baseline_metrics["hedge_effectiveness"],
+        enhanced_metrics["hedge_effectiveness"],
+    )
+    enhanced_metrics["baseline_hedge_effectiveness"] = float(baseline_metrics["hedge_effectiveness"])
+    enhanced_metrics["hedge_effectiveness_uplift_pct"] = float(uplift)
+    enhanced_metrics["target_uplift_10pct_achieved"] = bool(uplift >= 0.10)
+
+    use_enhanced = (
+        enhanced_metrics["hedge_effectiveness"] >= baseline_metrics["hedge_effectiveness"]
+        and enhanced_metrics["variance_reduction_p_value"] <= baseline_metrics["variance_reduction_p_value"]
+    )
+
+    chosen_returns = enhanced_returns if use_enhanced else baseline_returns
+    chosen_diag = enhanced_diag if use_enhanced else baseline_diag
+    chosen_metrics = enhanced_metrics if use_enhanced else baseline_metrics
+    chosen_metrics["selected_strategy"] = "enhanced" if use_enhanced else "baseline"
 
     print("\n========== PERFORMANCE ==========")
-    print("Sharpe Ratio:", round(metrics["sharpe_ratio"], 4))
-    print("Sortino Ratio:", round(metrics["sortino_ratio"], 4))
-    print("Max Drawdown:", round(metrics["max_drawdown"], 4))
-    print("Hedge Effectiveness:", round(metrics["hedge_effectiveness"], 4))
+    print("Selected strategy:", chosen_metrics["selected_strategy"])
+    print("Sharpe Ratio:", round(chosen_metrics["sharpe_ratio"], 4))
+    print("Sortino Ratio:", round(chosen_metrics["sortino_ratio"], 4))
+    print("Max Drawdown:", round(chosen_metrics["max_drawdown"], 4))
+    print("Hedge Effectiveness:", round(chosen_metrics["hedge_effectiveness"], 4))
+    print("Variance-reduction p-value:", round(chosen_metrics["variance_reduction_p_value"], 4))
+    if "hedge_effectiveness_uplift_pct" in chosen_metrics:
+        print("Hedge effectiveness uplift vs baseline:", round(chosen_metrics["hedge_effectiveness_uplift_pct"] * 100, 2), "%")
 
-    results_df = pd.DataFrame({"Hedged_Return": portfolio_returns})
+    results_df = pd.DataFrame({"Hedged_Return": chosen_returns})
     results_df.to_csv("hedged_portfolio_results.csv", index=False)
 
-    if not diagnostics.empty:
-        diagnostics.to_csv("hedge_diagnostics.csv", index=False)
+    if not chosen_diag.empty:
+        chosen_diag.to_csv("hedge_diagnostics.csv", index=False)
 
     with open("performance_metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(chosen_metrics, f, indent=2)
 
     print("\nResults saved to hedged_portfolio_results.csv")
     print("Diagnostics saved to hedge_diagnostics.csv and performance_metrics.json")

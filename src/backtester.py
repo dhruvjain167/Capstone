@@ -23,6 +23,10 @@ from config import (
     MOMENTUM_LOOKBACK,
     DRAWDOWN_LOOKBACK,
     DRAWDOWN_THRESHOLD,
+    HEDGE_SHRINKAGE,
+    CORRELATION_FLOOR,
+    NO_TRADE_BAND,
+    STABILITY_LOOKBACK,
 )
 from .garch_x_model import fit_garch, fit_garch_x
 from .dcc_model import compute_dcc
@@ -72,7 +76,11 @@ def _safe_allocation(sentiment_t, target_window, recent_portfolio_returns):
     momentum = _rolling_momentum(target_window.values, MOMENTUM_LOOKBACK)
     momentum_penalty = 1.0 if momentum < 0 else 0.0
 
-    vol_now = np.std(target_window.values[-MOMENTUM_LOOKBACK:]) if len(target_window) >= MOMENTUM_LOOKBACK else np.std(target_window.values)
+    if len(target_window) >= MOMENTUM_LOOKBACK:
+        vol_now = np.std(target_window.values[-MOMENTUM_LOOKBACK:])
+    else:
+        vol_now = np.std(target_window.values)
+
     vol_baseline = np.std(target_window.values)
     vol_stress = np.clip((vol_now / max(vol_baseline, 1e-8)) - 1.0, 0.0, 1.0)
 
@@ -86,7 +94,30 @@ def _safe_allocation(sentiment_t, target_window, recent_portfolio_returns):
     return float(np.clip(safe_w, MIN_SAFE_ALLOCATION, MAX_SAFE_ALLOCATION)), float(stress_score), float(drawdown)
 
 
-def run_backtest(df, return_diagnostics=False):
+def _hedge_quality_scale(target_window, hedge_window):
+    """Use realized target-vs-hedge co-movement to avoid unstable hedge ratios."""
+    if len(target_window) < 5 or len(hedge_window) < 5:
+        return 0.0, 0.0
+
+    corr = np.corrcoef(target_window, hedge_window)[0, 1]
+    if not np.isfinite(corr):
+        return 0.0, 0.0
+
+    if corr <= CORRELATION_FLOOR:
+        return 0.0, float(corr)
+
+    quality = np.clip((corr - CORRELATION_FLOOR) / max(1.0 - CORRELATION_FLOOR, 1e-8), 0.0, 1.0)
+    return float(quality), float(corr)
+
+
+def _apply_no_trade_band(candidate_weights, prev_weights):
+    delta = candidate_weights - prev_weights
+    keep_prev = np.abs(delta) < NO_TRADE_BAND
+    final = np.where(keep_prev, prev_weights, candidate_weights)
+    return final, int(np.sum(keep_prev))
+
+
+def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_quality_controls=True):
     if "sentiment_score" not in df.columns:
         df = df.copy()
         df["sentiment_score"] = 0.0
@@ -169,10 +200,23 @@ def run_backtest(df, return_diagnostics=False):
                 full_new[idx] = sent_adjusted[v_idx]
                 full_raw[idx] = raw_hedge[v_idx]
 
-        smoothed_weights = (
-            WEIGHT_SMOOTHING_ALPHA * full_new + (1.0 - WEIGHT_SMOOTHING_ALPHA) * prev_weights
-        )
-        final_weights, gross_exposure = _normalize_to_gross_cap(smoothed_weights, MAX_GROSS_EXPOSURE)
+        smoothed_weights = WEIGHT_SMOOTHING_ALPHA * full_new + (1.0 - WEIGHT_SMOOTHING_ALPHA) * prev_weights
+
+        if use_quality_controls:
+            smoothed_weights = HEDGE_SHRINKAGE * smoothed_weights
+            lookback_start = max(0, t - STABILITY_LOOKBACK)
+            target_window = returns[TARGET_ASSET].iloc[lookback_start:t].values
+            hedge_window = np.dot(
+                returns[available_hedges].iloc[lookback_start:t].fillna(0.0).values,
+                np.nan_to_num(smoothed_weights, nan=0.0),
+            )
+            quality_scale, realized_corr = _hedge_quality_scale(target_window, hedge_window)
+            quality_weights = smoothed_weights * quality_scale
+            capped_weights, gross_exposure = _normalize_to_gross_cap(quality_weights, MAX_GROSS_EXPOSURE)
+            final_weights, no_trade_assets = _apply_no_trade_band(capped_weights, prev_weights)
+        else:
+            quality_scale, realized_corr, no_trade_assets = 1.0, 0.0, 0
+            final_weights, gross_exposure = _normalize_to_gross_cap(smoothed_weights, MAX_GROSS_EXPOSURE)
 
         turnover = float(np.sum(np.abs(final_weights - prev_weights)))
         cost = turnover * (TRANSACTION_COST_BPS / 10000.0)
@@ -184,16 +228,21 @@ def run_backtest(df, return_diagnostics=False):
         hedge_returns = float(np.dot(final_weights, hedge_asset_returns))
         raw_portfolio_r = target_return - hedge_returns - cost
 
-        safe_weight, stress_score, rolling_drawdown = _safe_allocation(
-            sentiment.iloc[t],
-            returns[TARGET_ASSET].iloc[t - WINDOW : t],
-            portfolio_returns,
-        )
-        safe_return = float(safe_returns.iloc[t])
+        if use_defensive_overlay:
+            safe_weight, stress_score, rolling_drawdown = _safe_allocation(
+                sentiment.iloc[t],
+                returns[TARGET_ASSET].iloc[t - WINDOW : t],
+                portfolio_returns,
+            )
+            safe_return = float(safe_returns.iloc[t])
+        else:
+            safe_weight, stress_score, rolling_drawdown = 0.0, 0.0, 0.0
+            safe_return = 0.0
+
         blended_portfolio_r = (1.0 - safe_weight) * raw_portfolio_r + safe_weight * safe_return
 
         est_vol = _ewma_volatility(portfolio_returns, lam=EWMA_LAMBDA)
-        leverage = float(np.clip(VOL_TARGET / max(est_vol, 1e-6), 0.5, 1.5))
+        leverage = float(np.clip(VOL_TARGET / max(est_vol, 1e-6), 0.75, 1.25))
         portfolio_r = blended_portfolio_r * leverage
 
         portfolio_returns.append(portfolio_r)
@@ -215,6 +264,9 @@ def run_backtest(df, return_diagnostics=False):
             "safe_allocation": safe_weight,
             "regime_stress": stress_score,
             "rolling_drawdown": rolling_drawdown,
+            "realized_target_hedge_corr": realized_corr,
+            "hedge_quality_scale": quality_scale,
+            "no_trade_assets": no_trade_assets,
             "sentiment_score": float(sentiment.iloc[t]),
             "sentiment_multiplier": sentiment_multiplier,
             "confidence_scale": confidence,
