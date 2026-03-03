@@ -27,6 +27,16 @@ from config import (
     CORRELATION_FLOOR,
     NO_TRADE_BAND,
     STABILITY_LOOKBACK,
+    REGIME_METHOD,
+    REGIME_LOOKBACK,
+    REGIME_VOL_MULTIPLIER,
+    REGIME_MIN_OBS,
+    DCC_A_CALM,
+    DCC_B_CALM,
+    DCC_A_STRESS,
+    DCC_B_STRESS,
+    STRESS_GROSS_EXPOSURE_MULT,
+    STRESS_HEDGE_SHRINKAGE_MULT,
 )
 from .garch_x_model import fit_garch, fit_garch_x
 from .dcc_model import compute_dcc
@@ -117,6 +127,49 @@ def _apply_no_trade_band(candidate_weights, prev_weights):
     return final, int(np.sum(keep_prev))
 
 
+def _detect_regime_flags(target_series):
+    """Volatility-threshold regime detector: True means stress regime."""
+    x = np.asarray(target_series, dtype=float)
+    n = len(x)
+    flags = np.zeros(n, dtype=bool)
+    if n < 2:
+        return flags
+
+    look = max(5, min(REGIME_LOOKBACK, n))
+    for i in range(look, n + 1):
+        recent = x[i - look : i]
+        long_window = x[:i]
+        vol_recent = np.std(recent)
+        vol_long = np.std(long_window)
+        if vol_recent > REGIME_VOL_MULTIPLIER * max(vol_long, 1e-8):
+            flags[i - 1] = True
+    return flags
+
+
+def _regime_dcc(std_resids_array, regime_flags):
+    current_is_stress = bool(regime_flags[-1]) if len(regime_flags) else False
+
+    if current_is_stress:
+        dcc_a, dcc_b = DCC_A_STRESS, DCC_B_STRESS
+        label = "stress"
+    else:
+        dcc_a, dcc_b = DCC_A_CALM, DCC_B_CALM
+        label = "calm"
+
+    # Estimate separate DCC for the current regime using matching history.
+    idx = np.where(regime_flags == current_is_stress)[0]
+    if len(idx) >= REGIME_MIN_OBS:
+        resids_for_dcc = std_resids_array[idx]
+        used_obs = int(len(idx))
+    else:
+        # fallback to full sample if regime-specific history is too short
+        resids_for_dcc = std_resids_array
+        used_obs = int(len(std_resids_array))
+
+    R_series = compute_dcc(resids_for_dcc, dcc_a, dcc_b)
+    return R_series[-1], label, dcc_a, dcc_b, used_obs
+
+
 def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_quality_controls=True):
     if "sentiment_score" not in df.columns:
         df = df.copy()
@@ -173,8 +226,17 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
         if np.all(std_resids_array == 0) or np.all(np.isnan(std_resids_array)):
             continue
 
-        R_series = compute_dcc(std_resids_array, DCC_A, DCC_B)
-        H_t = engine.compute_covariance_matrix(R_series[-1], sigmas_last)
+        regime_flags = _detect_regime_flags(window[TARGET_ASSET].fillna(0.0).values)
+
+        if REGIME_METHOD == "vol_threshold":
+            R_t, regime_label, regime_dcc_a, regime_dcc_b, regime_obs = _regime_dcc(std_resids_array, regime_flags)
+        else:
+            # default fallback to non-regime DCC
+            R_series = compute_dcc(std_resids_array, DCC_A, DCC_B)
+            R_t = R_series[-1]
+            regime_label, regime_dcc_a, regime_dcc_b, regime_obs = "single", DCC_A, DCC_B, len(std_resids_array)
+
+        H_t = engine.compute_covariance_matrix(R_t, sigmas_last)
 
         raw_hedge = engine.compute_multivariate_hedge(
             H_t,
@@ -202,8 +264,14 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
 
         smoothed_weights = WEIGHT_SMOOTHING_ALPHA * full_new + (1.0 - WEIGHT_SMOOTHING_ALPHA) * prev_weights
 
+        regime_shrink = HEDGE_SHRINKAGE
+        regime_gross_cap = MAX_GROSS_EXPOSURE
+        if regime_label == "stress":
+            regime_shrink = HEDGE_SHRINKAGE * STRESS_HEDGE_SHRINKAGE_MULT
+            regime_gross_cap = MAX_GROSS_EXPOSURE * STRESS_GROSS_EXPOSURE_MULT
+
         if use_quality_controls:
-            smoothed_weights = HEDGE_SHRINKAGE * smoothed_weights
+            smoothed_weights = regime_shrink * smoothed_weights
             lookback_start = max(0, t - STABILITY_LOOKBACK)
             target_window = returns[TARGET_ASSET].iloc[lookback_start:t].values
             hedge_window = np.dot(
@@ -212,11 +280,11 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
             )
             quality_scale, realized_corr = _hedge_quality_scale(target_window, hedge_window)
             quality_weights = smoothed_weights * quality_scale
-            capped_weights, gross_exposure = _normalize_to_gross_cap(quality_weights, MAX_GROSS_EXPOSURE)
+            capped_weights, gross_exposure = _normalize_to_gross_cap(quality_weights, regime_gross_cap)
             final_weights, no_trade_assets = _apply_no_trade_band(capped_weights, prev_weights)
         else:
             quality_scale, realized_corr, no_trade_assets = 1.0, 0.0, 0
-            final_weights, gross_exposure = _normalize_to_gross_cap(smoothed_weights, MAX_GROSS_EXPOSURE)
+            final_weights, gross_exposure = _normalize_to_gross_cap(smoothed_weights, regime_gross_cap)
 
         turnover = float(np.sum(np.abs(final_weights - prev_weights)))
         cost = turnover * (TRANSACTION_COST_BPS / 10000.0)
@@ -234,6 +302,8 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
                 returns[TARGET_ASSET].iloc[t - WINDOW : t],
                 portfolio_returns,
             )
+            if regime_label == "stress":
+                safe_weight = float(np.clip(safe_weight + 0.10, MIN_SAFE_ALLOCATION, MAX_SAFE_ALLOCATION))
             safe_return = float(safe_returns.iloc[t])
         else:
             safe_weight, stress_score, rolling_drawdown = 0.0, 0.0, 0.0
@@ -267,6 +337,10 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
             "realized_target_hedge_corr": realized_corr,
             "hedge_quality_scale": quality_scale,
             "no_trade_assets": no_trade_assets,
+            "regime_label": regime_label,
+            "regime_dcc_a": regime_dcc_a,
+            "regime_dcc_b": regime_dcc_b,
+            "regime_obs": regime_obs,
             "sentiment_score": float(sentiment.iloc[t]),
             "sentiment_multiplier": sentiment_multiplier,
             "confidence_scale": confidence,

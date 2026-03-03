@@ -55,6 +55,10 @@ k11, k12 = st.columns(2)
 k11.metric("HE Uplift vs Baseline", f"{metrics.get('hedge_effectiveness_uplift_pct', np.nan):.2%}")
 k12.metric("Selected Strategy", f"{metrics.get('selected_strategy', 'n/a')}")
 
+k13, k14 = st.columns(2)
+k13.metric("Stress Regime Share", f"{metrics.get('pct_stress_regime', np.nan):.2%}")
+k14.metric("Avg Regime Obs", f"{metrics.get('avg_regime_obs', np.nan):.1f}")
+
 st.subheader("Industry-Standard Interpretation")
 interp = []
 if metrics:
@@ -84,6 +88,12 @@ if metrics:
     if np.isfinite(uplift):
         interp.append(
             f"Hedge-effectiveness uplift vs baseline {uplift:.2%}: {'meets 10–15% investor target zone' if uplift >= 0.10 else 'below 10% target, continue tuning quality filters and cost controls'}"
+        )
+
+    stress_share = metrics.get("pct_stress_regime", np.nan)
+    if np.isfinite(stress_share):
+        interp.append(
+            f"Regime-switching DCC active: stress regime frequency {stress_share:.2%}; model switches DCC persistence/response across calm vs stress states."
         )
 
 st.markdown("\n".join([f"- {x}" for x in interp]) if interp else "Run backtest to generate interpretation.")
@@ -218,6 +228,24 @@ if diag_path.exists():
             )
             st.plotly_chart(fig_tc, use_container_width=True)
 
+    if {"regime_label", "regime_obs"}.issubset(diag_df.columns):
+        st.subheader("Regime-Switching DCC Monitor")
+        r1, r2 = st.columns(2)
+        with r1:
+            reg = diag_df.copy()
+            reg["stress_flag"] = (reg["regime_label"] == "stress").astype(int)
+            fig_reg = px.line(
+                reg,
+                x="date" if "date" in reg.columns else reg.index,
+                y=["stress_flag", "regime_obs"],
+                title="Stress Regime Flag and Regime-Specific DCC Sample Size",
+            )
+            st.plotly_chart(fig_reg, use_container_width=True)
+        with r2:
+            regime_counts = diag_df["regime_label"].value_counts(dropna=False).reset_index()
+            regime_counts.columns = ["Regime", "Count"]
+            st.dataframe(regime_counts, hide_index=True)
+
     if {"safe_allocation", "safe_asset_return", "regime_stress"}.issubset(diag_df.columns):
         st.subheader("Defensive Safe-Asset Overlay")
         c_safe_1, c_safe_2 = st.columns(2)
@@ -257,5 +285,7 @@ st.markdown(
 - **MOMENTUM_LOOKBACK / DRAWDOWN_THRESHOLD**: regime triggers that increase capital preservation in weak markets.
 - **HEDGE_SHRINKAGE / CORRELATION_FLOOR**: enforces conservative hedge sizing and only keeps hedges with robust realized co-movement.
 - **NO_TRADE_BAND / STABILITY_LOOKBACK**: reduces over-trading and increases post-cost robustness.
+- **DCC_A_CALM/B_CALM vs DCC_A_STRESS/B_STRESS**: regime-specific DCC dynamics for calm and stress states.
+- **REGIME_VOL_MULTIPLIER / REGIME_MIN_OBS**: controls volatility-threshold regime detection and minimum regime sample for stable estimation.
 """
 )

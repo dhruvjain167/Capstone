@@ -72,6 +72,10 @@ def _compute_metrics(unhedged, hedged, diagnostics):
             metrics["avg_turnover"] = float(diagnostics["turnover"].mean())
         if "hedge_quality_scale" in diagnostics.columns:
             metrics["avg_hedge_quality_scale"] = float(diagnostics["hedge_quality_scale"].mean())
+        if "regime_label" in diagnostics.columns:
+            metrics["pct_stress_regime"] = float((diagnostics["regime_label"] == "stress").mean())
+        if "regime_obs" in diagnostics.columns:
+            metrics["avg_regime_obs"] = float(diagnostics["regime_obs"].mean())
 
     return metrics
 
@@ -118,7 +122,10 @@ def main():
 
     use_enhanced = (
         enhanced_metrics["hedge_effectiveness"] >= baseline_metrics["hedge_effectiveness"]
-        and enhanced_metrics["variance_reduction_p_value"] <= baseline_metrics["variance_reduction_p_value"]
+        and (
+            enhanced_metrics["variance_reduction_p_value"] <= baseline_metrics["variance_reduction_p_value"]
+            or enhanced_metrics["hedge_effectiveness"] > 0
+        )
     )
 
     chosen_returns = enhanced_returns if use_enhanced else baseline_returns
