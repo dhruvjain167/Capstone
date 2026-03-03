@@ -59,6 +59,10 @@ k13, k14 = st.columns(2)
 k13.metric("Stress Regime Share", f"{metrics.get('pct_stress_regime', np.nan):.2%}")
 k14.metric("Avg Regime Obs", f"{metrics.get('avg_regime_obs', np.nan):.1f}")
 
+k15, k16 = st.columns(2)
+k15.metric("Avg Max Single Hedge Alloc", f"{metrics.get('avg_max_single_hedge_alloc', np.nan):.2%}")
+k16.metric("Sentiment Proxy Usage", f"{metrics.get('pct_sentiment_proxy_used', np.nan):.2%}")
+
 st.subheader("Industry-Standard Interpretation")
 interp = []
 if metrics:
@@ -94,6 +98,18 @@ if metrics:
     if np.isfinite(stress_share):
         interp.append(
             f"Regime-switching DCC active: stress regime frequency {stress_share:.2%}; model switches DCC persistence/response across calm vs stress states."
+        )
+
+    max_alloc = metrics.get("avg_max_single_hedge_alloc", np.nan)
+    if np.isfinite(max_alloc):
+        interp.append(
+            f"Hedge concentration control: average max single-asset share {max_alloc:.2%}; lower concentration improves robustness vs oil-dominant bets."
+        )
+
+    sent_proxy = metrics.get("pct_sentiment_proxy_used", np.nan)
+    if np.isfinite(sent_proxy):
+        interp.append(
+            f"Sentiment signal health: proxy used {sent_proxy:.2%} of windows because raw headline sentiment lacked variance; this explains weak sentiment impact when near 0%."
         )
 
 st.markdown("\n".join([f"- {x}" for x in interp]) if interp else "Run backtest to generate interpretation.")
@@ -228,6 +244,16 @@ if diag_path.exists():
             )
             st.plotly_chart(fig_tc, use_container_width=True)
 
+    if {"max_single_hedge_allocation", "gross_exposure"}.issubset(diag_df.columns):
+        st.subheader("Hedge Concentration & Exposure")
+        fig_conc = px.line(
+            diag_df,
+            x="date" if "date" in diag_df.columns else diag_df.index,
+            y=["max_single_hedge_allocation", "gross_exposure"],
+            title="Largest Single Hedge Allocation vs Gross Exposure",
+        )
+        st.plotly_chart(fig_conc, use_container_width=True)
+
     if {"regime_label", "regime_obs"}.issubset(diag_df.columns):
         st.subheader("Regime-Switching DCC Monitor")
         r1, r2 = st.columns(2)
@@ -287,5 +313,7 @@ st.markdown(
 - **NO_TRADE_BAND / STABILITY_LOOKBACK**: reduces over-trading and increases post-cost robustness.
 - **DCC_A_CALM/B_CALM vs DCC_A_STRESS/B_STRESS**: regime-specific DCC dynamics for calm and stress states.
 - **REGIME_VOL_MULTIPLIER / REGIME_MIN_OBS**: controls volatility-threshold regime detection and minimum regime sample for stable estimation.
+- **MAX_SINGLE_HEDGE_ALLOCATION**: caps single-asset dominance (e.g., crude concentration) in hedge notional.
+- **MIN_SENTIMENT_STD / SENTIMENT_PROXY_STRENGTH**: activates sentiment proxy when headline sentiment is near-constant so sentiment channel remains informative.
 """
 )

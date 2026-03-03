@@ -37,6 +37,9 @@ from config import (
     DCC_B_STRESS,
     STRESS_GROSS_EXPOSURE_MULT,
     STRESS_HEDGE_SHRINKAGE_MULT,
+    MAX_SINGLE_HEDGE_ALLOCATION,
+    MIN_SENTIMENT_STD,
+    SENTIMENT_PROXY_STRENGTH,
 )
 from .garch_x_model import fit_garch, fit_garch_x
 from .dcc_model import compute_dcc
@@ -170,6 +173,54 @@ def _regime_dcc(std_resids_array, regime_flags):
     return R_series[-1], label, dcc_a, dcc_b, used_obs
 
 
+
+
+def _effective_sentiment(sentiment_series, target_returns):
+    """If sentiment is almost constant, blend in a bounded market-stress proxy."""
+    sent = sentiment_series.fillna(0.0).astype(float).copy()
+    sent_std = float(sent.std())
+
+    if sent_std >= MIN_SENTIMENT_STD:
+        return sent, False
+
+    # proxy: negative target return implies risk-off sentiment
+    proxy = (-target_returns.fillna(0.0)).rolling(10, min_periods=2).mean()
+    proxy_std = float(proxy.std())
+    if proxy_std > 1e-8:
+        proxy = proxy / proxy_std
+    proxy = proxy.clip(-1.0, 1.0)
+
+    blended = (1.0 - SENTIMENT_PROXY_STRENGTH) * sent + SENTIMENT_PROXY_STRENGTH * proxy
+    return blended.clip(-1.0, 1.0), True
+
+
+def _enforce_allocation_cap(weights, max_single_allocation=0.55):
+    """Limit single-asset concentration in absolute hedge allocation."""
+    w = np.asarray(weights, dtype=float).copy()
+    abs_sum = float(np.sum(np.abs(w)))
+    if abs_sum <= 1e-12:
+        return w, 0.0
+
+    alloc = np.abs(w) / abs_sum
+    if np.max(alloc) <= max_single_allocation:
+        return w, float(np.max(alloc))
+
+    signs = np.sign(w)
+    alloc_capped = np.minimum(alloc, max_single_allocation)
+    residual = 1.0 - float(np.sum(alloc_capped))
+
+    if residual > 1e-12:
+        room = np.maximum(max_single_allocation - alloc_capped, 0.0)
+        room_sum = float(np.sum(room))
+        if room_sum > 1e-12:
+            alloc_capped = alloc_capped + residual * (room / room_sum)
+
+    alloc_capped = alloc_capped / max(float(np.sum(alloc_capped)), 1e-12)
+    out = signs * alloc_capped * abs_sum
+    out[np.isnan(out)] = 0.0
+    return out, float(np.max(np.abs(out) / max(np.sum(np.abs(out)), 1e-12)))
+
+
 def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_quality_controls=True):
     if "sentiment_score" not in df.columns:
         df = df.copy()
@@ -179,7 +230,10 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
     ordered_assets = [TARGET_ASSET] + available_hedges
 
     returns = df[ordered_assets]
-    sentiment = df["sentiment_score"].fillna(0.0)
+    sentiment, sentiment_proxy_used = _effective_sentiment(
+        df["sentiment_score"].fillna(0.0),
+        returns[TARGET_ASSET],
+    )
     safe_returns = df[SAFE_ASSET].fillna(0.0) if SAFE_ASSET in df.columns else pd.Series(0.0, index=df.index)
 
     engine = HedgeEngine()
@@ -286,6 +340,11 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
             quality_scale, realized_corr, no_trade_assets = 1.0, 0.0, 0
             final_weights, gross_exposure = _normalize_to_gross_cap(smoothed_weights, regime_gross_cap)
 
+        final_weights, max_single_alloc = _enforce_allocation_cap(
+            final_weights,
+            max_single_allocation=MAX_SINGLE_HEDGE_ALLOCATION,
+        )
+
         turnover = float(np.sum(np.abs(final_weights - prev_weights)))
         cost = turnover * (TRANSACTION_COST_BPS / 10000.0)
 
@@ -346,6 +405,9 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
             "confidence_scale": confidence,
             "turnover": turnover,
             "gross_exposure": gross_exposure,
+            "max_single_hedge_allocation": max_single_alloc,
+            "sentiment_proxy_used": int(sentiment_proxy_used),
+            "sentiment_std_window": float(sentiment.iloc[max(0, t - WINDOW):t].std()),
             "est_vol": est_vol,
         }
 

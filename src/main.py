@@ -76,6 +76,10 @@ def _compute_metrics(unhedged, hedged, diagnostics):
             metrics["pct_stress_regime"] = float((diagnostics["regime_label"] == "stress").mean())
         if "regime_obs" in diagnostics.columns:
             metrics["avg_regime_obs"] = float(diagnostics["regime_obs"].mean())
+        if "max_single_hedge_allocation" in diagnostics.columns:
+            metrics["avg_max_single_hedge_alloc"] = float(diagnostics["max_single_hedge_allocation"].mean())
+        if "sentiment_proxy_used" in diagnostics.columns:
+            metrics["pct_sentiment_proxy_used"] = float(diagnostics["sentiment_proxy_used"].mean())
 
     return metrics
 
