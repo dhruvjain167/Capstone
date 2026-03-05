@@ -63,6 +63,10 @@ k15, k16 = st.columns(2)
 k15.metric("Avg Max Single Hedge Alloc", f"{metrics.get('avg_max_single_hedge_alloc', np.nan):.2%}")
 k16.metric("Sentiment Proxy Usage", f"{metrics.get('pct_sentiment_proxy_used', np.nan):.2%}")
 
+k17, k18 = st.columns(2)
+k17.metric("Avg Sentiment Std", f"{metrics.get('avg_sentiment_std_window', np.nan):.4f}")
+k18.metric("Avg Sentiment Tilt", f"{metrics.get('avg_sentiment_tilt', np.nan):.3f}")
+
 st.subheader("Industry-Standard Interpretation")
 interp = []
 if metrics:
@@ -110,6 +114,12 @@ if metrics:
     if np.isfinite(sent_proxy):
         interp.append(
             f"Sentiment signal health: proxy used {sent_proxy:.2%} of windows because raw headline sentiment lacked variance; this explains weak sentiment impact when near 0%."
+        )
+
+    sent_std = metrics.get("avg_sentiment_std_window", np.nan)
+    if np.isfinite(sent_std):
+        interp.append(
+            f"Average trading-window sentiment std {sent_std:.4f}: very low values indicate sentiment is effectively flat and cannot move hedge ratios." 
         )
 
 st.markdown("\n".join([f"- {x}" for x in interp]) if interp else "Run backtest to generate interpretation.")

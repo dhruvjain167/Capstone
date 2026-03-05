@@ -40,6 +40,9 @@ from config import (
     MAX_SINGLE_HEDGE_ALLOCATION,
     MIN_SENTIMENT_STD,
     SENTIMENT_PROXY_STRENGTH,
+    ASSET_SENTIMENT_BETA,
+    SENTIMENT_CROSS_SECTIONAL_STRENGTH,
+    DIVERSIFICATION_BLEND,
 )
 from .garch_x_model import fit_garch, fit_garch_x
 from .dcc_model import compute_dcc
@@ -221,6 +224,33 @@ def _enforce_allocation_cap(weights, max_single_allocation=0.55):
     return out, float(np.max(np.abs(out) / max(np.sum(np.abs(out)), 1e-12)))
 
 
+
+
+def _asset_sentiment_tilt(assets, sentiment_t):
+    betas = np.array([ASSET_SENTIMENT_BETA.get(a, 0.0) for a in assets], dtype=float)
+    # negative sentiment -> increase positive beta assets (gold/usdinr/bonds), reduce crude
+    return 1.0 + SENTIMENT_CROSS_SECTIONAL_STRENGTH * betas * float(np.tanh(-sentiment_t))
+
+
+def _diversify_weights(weights, assets, window_returns):
+    w = np.asarray(weights, dtype=float)
+    if len(w) == 0:
+        return w
+
+    cols = [a for a in assets if a in window_returns.columns]
+    if len(cols) != len(assets):
+        return w
+
+    vols = window_returns[assets].std().replace(0.0, np.nan).fillna(window_returns[assets].std().mean()).values
+    inv_vol = 1.0 / np.maximum(vols, 1e-8)
+    inv_vol = inv_vol / max(float(np.sum(inv_vol)), 1e-8)
+
+    gross = float(np.sum(np.abs(w)))
+    target = np.sign(w) * inv_vol * gross
+    blended = (1.0 - DIVERSIFICATION_BLEND) * w + DIVERSIFICATION_BLEND * target
+    return blended
+
+
 def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_quality_controls=True):
     if "sentiment_score" not in df.columns:
         df = df.copy()
@@ -306,6 +336,10 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
             sentiment.iloc[t],
             strength=SENTIMENT_STRENGTH,
         )
+
+        asset_tilt = _asset_sentiment_tilt(valid_hedges, sentiment.iloc[t])
+        sent_adjusted = sent_adjusted * asset_tilt
+        sent_adjusted = _diversify_weights(sent_adjusted, valid_hedges, window)
 
         full_new = np.zeros(len(available_hedges), dtype=float)
         full_raw = np.zeros(len(available_hedges), dtype=float)
@@ -402,6 +436,7 @@ def run_backtest(df, return_diagnostics=False, use_defensive_overlay=True, use_q
             "regime_obs": regime_obs,
             "sentiment_score": float(sentiment.iloc[t]),
             "sentiment_multiplier": sentiment_multiplier,
+            "sentiment_tilt_avg": float(np.mean(asset_tilt)) if len(valid_hedges) else 1.0,
             "confidence_scale": confidence,
             "turnover": turnover,
             "gross_exposure": gross_exposure,

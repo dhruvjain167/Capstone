@@ -16,10 +16,10 @@ from src.evaluation import (
     variance_reduction_significance,
     hedge_effectiveness_uplift_pct,
 )
-from config import TARGET_ASSET, BOOTSTRAP_SAMPLES, RANDOM_SEED
+from config import TARGET_ASSET, BOOTSTRAP_SAMPLES, RANDOM_SEED, SENTIMENT_LOOKBACK_DAYS, SENTIMENT_EWMA_SPAN
 
 
-def _load_sentiment(returns, days=14):
+def _load_sentiment(returns, days=SENTIMENT_LOOKBACK_DAYS):
     print("Fetching market sentiment...")
     try:
         sent_engine = FinBERTSentiment()
@@ -33,10 +33,20 @@ def _load_sentiment(returns, days=14):
         return returns
 
     daily_sentiment["date"] = pd.to_datetime(daily_sentiment["date"])
-    daily_sentiment.set_index("date", inplace=True)
+    daily_sentiment = daily_sentiment.sort_values("date").set_index("date")
 
-    returns = returns.join(daily_sentiment, how="left")
-    returns["sentiment_score"] = returns["sentiment_score"].fillna(0.0)
+    # Map sparse news to trading calendar so sentiment is time-varying on trading days.
+    sent = daily_sentiment["sentiment_score"].reindex(returns.index).ffill().fillna(0.0)
+    sent = sent.ewm(span=SENTIMENT_EWMA_SPAN, adjust=False).mean()
+
+    # Normalize and clip to stable range; avoids near-constant multipliers.
+    sent_std = float(sent.std())
+    if sent_std > 1e-8:
+        sent = (sent - sent.mean()) / sent_std
+    sent = sent.clip(-1.0, 1.0)
+
+    returns = returns.copy()
+    returns["sentiment_score"] = sent
     return returns
 
 
@@ -80,6 +90,10 @@ def _compute_metrics(unhedged, hedged, diagnostics):
             metrics["avg_max_single_hedge_alloc"] = float(diagnostics["max_single_hedge_allocation"].mean())
         if "sentiment_proxy_used" in diagnostics.columns:
             metrics["pct_sentiment_proxy_used"] = float(diagnostics["sentiment_proxy_used"].mean())
+        if "sentiment_std_window" in diagnostics.columns:
+            metrics["avg_sentiment_std_window"] = float(diagnostics["sentiment_std_window"].mean())
+        if "sentiment_tilt_avg" in diagnostics.columns:
+            metrics["avg_sentiment_tilt"] = float(diagnostics["sentiment_tilt_avg"].mean())
 
     return metrics
 
@@ -92,7 +106,7 @@ def main():
     returns = compute_returns(prices)
     returns.index = pd.to_datetime(returns.index)
 
-    returns = _load_sentiment(returns, days=14)
+    returns = _load_sentiment(returns, days=SENTIMENT_LOOKBACK_DAYS)
 
     print("\nRunning baseline backtest...")
     baseline_returns, baseline_diag = run_backtest(
