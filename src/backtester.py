@@ -11,6 +11,14 @@ from config import (
     MAX_HEDGE_WEIGHT,
     VOL_TARGET,
     EWMA_LAMBDA,
+    SAFE_ASSET,
+    MIN_TARGET_EXPOSURE,
+    MAX_TARGET_EXPOSURE,
+    SENTIMENT_EXPOSURE_BETA,
+    MOMENTUM_EXPOSURE_BETA,
+    DRAWDOWN_EXPOSURE_BETA,
+    CASH_DAILY_RETURN_FLOOR,
+    RECENT_DRAWDOWN_WINDOW,
 )
 from .garch_x_model import fit_garch, fit_garch_x
 from .dcc_model import compute_dcc
@@ -26,6 +34,34 @@ def _ewma_volatility(values, lam=0.94):
         vol2 = lam * vol2 + (1 - lam) * (x ** 2)
 
     return float(np.sqrt(max(vol2, 1e-10)))
+
+
+def _recent_drawdown(returns_window):
+    if len(returns_window) < 2:
+        return 0.0
+
+    cumulative = np.cumprod(1 + np.array(returns_window, dtype=float))
+    running_peak = np.maximum.accumulate(cumulative)
+    drawdowns = (cumulative - running_peak) / np.maximum(running_peak, 1e-12)
+    return float(np.min(drawdowns))
+
+
+def _target_exposure(window_target, sentiment_value, recent_portfolio_returns):
+    momentum = float(window_target.mean())
+    momentum_vol = float(window_target.std())
+    momentum_score = momentum / max(momentum_vol, 1e-6)
+
+    sentiment_score = float(np.clip(sentiment_value, -1.0, 1.0))
+    drawdown = _recent_drawdown(recent_portfolio_returns[-RECENT_DRAWDOWN_WINDOW:])
+
+    raw_exposure = (
+        0.65
+        + MOMENTUM_EXPOSURE_BETA * np.tanh(momentum_score)
+        + SENTIMENT_EXPOSURE_BETA * np.tanh(sentiment_score)
+        + DRAWDOWN_EXPOSURE_BETA * np.tanh(drawdown * 5)
+    )
+
+    return float(np.clip(raw_exposure, MIN_TARGET_EXPOSURE, MAX_TARGET_EXPOSURE))
 
 
 def run_backtest(df, return_diagnostics=False):
@@ -83,7 +119,7 @@ def run_backtest(df, return_diagnostics=False):
             ridge_lambda=RIDGE_LAMBDA,
             max_weight=MAX_HEDGE_WEIGHT,
         )
-        hedge_vector = engine.adjust_for_sentiment(hedge_vector, sentiment.iloc[t])
+        hedge_vector, sentiment_multiplier = engine.adjust_for_sentiment(hedge_vector, sentiment.iloc[t])
 
         r_t = returns.iloc[t]
         hedge_assets = [c for c in valid_cols if c != TARGET_ASSET]
@@ -99,7 +135,16 @@ def run_backtest(df, return_diagnostics=False):
 
         est_vol = _ewma_volatility(portfolio_returns, lam=EWMA_LAMBDA)
         leverage = float(np.clip(VOL_TARGET / max(est_vol, 1e-6), 0.5, 1.5))
-        portfolio_r = raw_portfolio_r * leverage
+        exposure = _target_exposure(window[TARGET_ASSET], sentiment.iloc[t], portfolio_returns)
+        safe_weight = 1.0 - exposure
+
+        safe_return = float(r_t.get(SAFE_ASSET, np.nan)) if SAFE_ASSET in returns.columns else np.nan
+        if not np.isfinite(safe_return):
+            safe_return = CASH_DAILY_RETURN_FLOOR
+        safe_return = max(safe_return, CASH_DAILY_RETURN_FLOOR)
+
+        blended_return = (exposure * raw_portfolio_r) + (safe_weight * safe_return)
+        portfolio_r = blended_return * leverage
 
         portfolio_returns.append(portfolio_r)
 
@@ -109,9 +154,14 @@ def run_backtest(df, return_diagnostics=False):
                 "target_return": float(r_t.get(TARGET_ASSET, 0.0)),
                 "hedge_return": hedge_returns,
                 "raw_hedged_return": raw_portfolio_r,
+                "blended_return": blended_return,
                 "leverage": leverage,
                 "hedged_return": portfolio_r,
                 "sentiment_score": float(sentiment.iloc[t]),
+                "sentiment_multiplier": sentiment_multiplier,
+                "target_exposure": exposure,
+                "safe_asset_weight": safe_weight,
+                "safe_asset_return": safe_return,
                 "est_vol": est_vol,
             }
         )
