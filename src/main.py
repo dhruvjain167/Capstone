@@ -38,6 +38,9 @@ def main():
     returns.index = pd.to_datetime(returns.index)
 
     returns = _load_sentiment(returns, days=14)
+    
+    # Save the processed returns so the user can verify preprocessing and new columns
+    returns.to_csv("returns.csv")
 
     print("\nRunning dynamic hedge backtest...")
     portfolio_returns, diagnostics = run_backtest(returns, return_diagnostics=True)

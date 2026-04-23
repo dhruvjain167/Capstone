@@ -46,6 +46,23 @@ def _recent_drawdown(returns_window):
     return float(np.min(drawdowns))
 
 
+def _classify_regime(window_target, est_vol, vol_threshold_high=0.015, vol_threshold_low=0.006):
+    """
+    Classify market regime based on volatility and momentum.
+    Returns: 'crisis', 'high_vol', 'normal', 'low_vol'
+    """
+    momentum = float(window_target.mean())
+    
+    if est_vol > vol_threshold_high and momentum < 0:
+        return "crisis"
+    elif est_vol > vol_threshold_high:
+        return "high_vol"
+    elif est_vol < vol_threshold_low:
+        return "low_vol"
+    else:
+        return "normal"
+
+
 def _target_exposure(window_target, sentiment_value, recent_portfolio_returns):
     momentum = float(window_target.mean())
     momentum_vol = float(window_target.std())
@@ -148,23 +165,41 @@ def run_backtest(df, return_diagnostics=False):
 
         portfolio_returns.append(portfolio_r)
 
-        diagnostics.append(
-            {
-                "date": returns.index[t],
-                "target_return": float(r_t.get(TARGET_ASSET, 0.0)),
-                "hedge_return": hedge_returns,
-                "raw_hedged_return": raw_portfolio_r,
-                "blended_return": blended_return,
-                "leverage": leverage,
-                "hedged_return": portfolio_r,
-                "sentiment_score": float(sentiment.iloc[t]),
-                "sentiment_multiplier": sentiment_multiplier,
-                "target_exposure": exposure,
-                "safe_asset_weight": safe_weight,
-                "safe_asset_return": safe_return,
-                "est_vol": est_vol,
-            }
-        )
+        # Classify market regime
+        regime = _classify_regime(window[TARGET_ASSET], est_vol)
+
+        # Compute confidence scale for diagnostics
+        confidence = engine.confidence_scale(H_t)
+
+        # Build rolling correlation between target and each hedge asset
+        corr_dict = {}
+        for i, asset_name in enumerate(hedge_assets):
+            if asset_name in window.columns:
+                corr_val = window[TARGET_ASSET].corr(window[asset_name])
+                corr_dict[f"corr_{asset_name}"] = float(corr_val) if np.isfinite(corr_val) else 0.0
+
+        diag_entry = {
+            "date": returns.index[t],
+            "target_return": float(r_t.get(TARGET_ASSET, 0.0)),
+            "hedge_return": hedge_returns,
+            "raw_hedged_return": raw_portfolio_r,
+            "blended_return": blended_return,
+            "leverage": leverage,
+            "hedged_return": portfolio_r,
+            "sentiment_score": float(sentiment.iloc[t]),
+            "sentiment_multiplier": sentiment_multiplier,
+            "target_exposure": exposure,
+            "safe_asset_weight": safe_weight,
+            "safe_asset_return": safe_return,
+            "est_vol": est_vol,
+            "regime": regime,
+            "confidence": confidence,
+        }
+        
+        # Add correlations
+        diag_entry.update(corr_dict)
+
+        diagnostics.append(diag_entry)
 
         if len(hedge_assets) > 0:
             for asset_name, weight in zip(hedge_assets, trimmed_hedge):
