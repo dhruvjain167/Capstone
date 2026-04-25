@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-from GoogleNews import GoogleNews
+import requests
+import os
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from datetime import datetime, timedelta
 import torch
@@ -31,33 +32,49 @@ class FinBERTSentiment:
 
 
     # ==========================================
-    # 2️⃣ NEWS FETCHING
+    # 2️⃣ NEWS FETCHING (Using SERP API)
     # ==========================================
     
     def fetch_news(self, days=7):
         
+        # Get SERP API key from environment variable
+        serp_api_key = "9d2fc6ef0137cd14d84b1f2a8113f2f84ae4acd1de1df8a48d02d1cb49424695"
+        if not serp_api_key:
+            raise ValueError("SERP_API_KEY environment variable is not set. Please set it with your API key from https://serpapi.com")
+        
         queries = [
             "NIFTY 50 India",
             "RBI policy India",
-            "Indian stock market crash",
+            "Indian stock market",
             "USD INR India",
             "Gold price India",
             "Crude oil India"
         ]
         
-        googlenews = GoogleNews(lang="en", region="IN")
-        googlenews.set_period(f"{days}d")
-        
         all_results = []
         
         for query in queries:
-            googlenews.search(query)
-            for page in range(1, 4):
-                googlenews.get_page(page)
+            try:
+                # Use SERP API for news search
+                params = {
+                    "q": query,
+                    "type": "news",
+                    "api_key": serp_api_key,
+                    "google_domain": "google.co.in",
+                    "tbm": "nws",  # News search
+                }
+                
+                response = requests.get("https://serpapi.com/search", params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Extract news results
+                if "news_results" in data:
+                    all_results.extend(data["news_results"])
             
-            results = googlenews.results()
-            all_results.extend(results)
-            googlenews.clear()
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching news for query '{query}': {e}")
+                continue
         
         processed_data = []
         current_date = datetime.now()
@@ -68,19 +85,33 @@ class FinBERTSentiment:
             date_str = item.get("date", "")
             entry_date = current_date
             
+            # Try to parse the date from the response
             try:
-                if "hour" in date_str or "min" in date_str:
-                    entry_date = current_date
-                elif "day" in date_str:
-                    days_ago = int(date_str.split(" ")[0])
-                    entry_date = current_date - timedelta(days=days_ago)
+                if date_str:
+                    # SERP API returns dates in various formats, attempt to parse
+                    if "ago" in date_str:
+                        # Handle relative dates like "2 hours ago", "1 day ago"
+                        parts = date_str.split()
+                        if len(parts) >= 2:
+                            count = int(parts[0])
+                            unit = parts[1].lower()
+                            
+                            if "hour" in unit:
+                                entry_date = current_date - timedelta(hours=count)
+                            elif "day" in unit:
+                                entry_date = current_date - timedelta(days=count)
+                            elif "week" in unit:
+                                entry_date = current_date - timedelta(weeks=count)
+                            elif "month" in unit:
+                                entry_date = current_date - timedelta(days=count*30)
             except:
                 pass
             
-            processed_data.append({
-                "date": entry_date.date(),
-                "headline": headline
-            })
+            if headline:  # Only add if headline is not empty
+                processed_data.append({
+                    "date": entry_date.date(),
+                    "headline": headline
+                })
         
         df = pd.DataFrame(processed_data).drop_duplicates()
         return df
